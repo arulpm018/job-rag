@@ -1,0 +1,6 @@
+psycopg2-binary==2.9.9
+sentence-transformers==3.0.1
+python-dotenv==1.0.1
+numpy==1.26.4
+torch==2.3.0
+transformers==4.41.0
