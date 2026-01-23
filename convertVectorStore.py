@@ -5,39 +5,59 @@ from typing import List, Tuple
 import re
 from dotenv import load_dotenv
 import os
+import time
+import torch
 
 load_dotenv()
 
 class HierarchicalVectorStore:
-    def __init__(self, db_config: dict):
+    def __init__(self, db_config: dict, device: str = None):
         """
         Initialize dengan database config
-        db_config format:
-        {
+        db_config format: {
             'host': 'localhost',
             'database': 'your_db',
             'user': 'your_user',
             'password': 'your_password',
             'port': 5432
         }
+        device: 'cuda', 'cpu', or None (auto-detect)
         """
         self.db_config = db_config
-        # Load Qwen embedding model (1024 dimensions)
-        print("Loading Qwen3-Embedding-0.6B model...")
-        self.model = SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')
-        self.embedding_dim = 1024  # Qwen3-Embedding-0.6B menghasilkan 1024 dimensi
-        print(f"Model loaded successfully! Embedding dimension: {self.embedding_dim}")
         
+        # Deteksi dan setup device (GPU/CPU)
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+        
+        print(f"Using device: {self.device}")
+        if self.device == 'cuda':
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
+        # Load Qwen embedding model (1024 dimensions) ke GPU
+        print("Loading Qwen3-Embedding-0.6B model...")
+        self.model = SentenceTransformer('Qwen/Qwen3-Embedding-0.6B', device=self.device)
+        self.embedding_dim = 1024  # Qwen3-Embedding-0.6B menghasilkan 1024 dimensi
+        
+        print(f"Model loaded successfully on {self.device}!")
+        print(f"Embedding dimension: {self.embedding_dim}")
+        
+        # Verify model is on GPU
+        if self.device == 'cuda':
+            print(f"Model device verification: {next(self.model.parameters()).device}")
+
     def connect_db(self):
         """Koneksi ke database"""
         return psycopg2.connect(**self.db_config)
-    
+
     def count_words(self, text: str) -> int:
         """Hitung jumlah kata dalam teks"""
         if not text:
             return 0
         return len(text.split())
-    
+
     def split_abstract(self, abstract: str, chunk_size: int = 600, overlap: int = 100) -> List[str]:
         """
         Split abstract jika lebih dari 1000 kata
@@ -62,23 +82,24 @@ class HierarchicalVectorStore:
             # Jika sudah sampai akhir, break
             if end >= word_count:
                 break
-                
+            
             # Move start dengan mempertimbangkan overlap
             start = end - overlap
         
         return chunks
-    
+
     def generate_embedding(self, text: str) -> List[float]:
         """Generate embedding vector dari text menggunakan Qwen3-Embedding-0.6B"""
         if not text or text.strip() == '':
             # Return zero vector jika text kosong
             return [0.0] * self.embedding_dim
         
+        # Model akan otomatis menggunakan GPU karena sudah di-load ke GPU
         embedding = self.model.encode(text, normalize_embeddings=True)
         return embedding.tolist()
-    
-    def insert_vector(self, conn, paper_id: str, chunk_type: str, 
-                     content_chunk: str, chunk_index: int, embedding: List[float]):
+
+    def insert_vector(self, conn, paper_id: str, chunk_type: str, content_chunk: str, 
+                     chunk_index: int, embedding: List[float]):
         """Insert vector ke database"""
         cursor = conn.cursor()
         
@@ -86,52 +107,139 @@ class HierarchicalVectorStore:
         embedding_str = '[' + ','.join(map(str, embedding)) + ']'
         
         query = """
-        INSERT INTO bot.vector_store (paper_id, chunk_type, content_chunk, chunk_index, embedding)
-        VALUES (%s, %s, %s, %s, %s::vector)
+            INSERT INTO bot.vector_store 
+            (paper_id, chunk_type, content_chunk, chunk_index, embedding)
+            VALUES (%s, %s, %s, %s, %s::vector)
         """
         
         cursor.execute(query, (paper_id, chunk_type, content_chunk, chunk_index, embedding_str))
         cursor.close()
-    
-    def process_paper(self, paper_id: str, title: str, abstract: str, keywords: str):
+
+    def is_valid_text(self, text) -> bool:
+        """Check apakah text valid (tidak None, tidak kosong setelah strip)"""
+        if text is None:
+            return False
+        if isinstance(text, str) and text.strip() == '':
+            return False
+        return True
+
+    def process_paper(self, paper_id: str, title: str, abstract: str, keywords: str, 
+                     max_retries: int = 3):
         """
-        Process satu paper menjadi embeddings
+        Process satu paper menjadi embeddings dengan retry mechanism
         """
         conn = self.connect_db()
+        processed_fields = []
+        failed_fields = []
         
         try:
             # 1. Process TITLE
-            if title and title.strip():
-                print(f"Processing title for paper {paper_id}")
-                title_embedding = self.generate_embedding(title)
-                self.insert_vector(conn, paper_id, 'title', title, 0, title_embedding)
-            
+            if self.is_valid_text(title):
+                print(f"  → Processing title for paper {paper_id}")
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        title_embedding = self.generate_embedding(title)
+                        self.insert_vector(conn, paper_id, 'title', title, 0, title_embedding)
+                        processed_fields.append('title')
+                        print(f"    ✓ Title processed successfully")
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            print(f"    ⚠ Error processing title (attempt {retry_count}/{max_retries}): {str(e)}")
+                            print(f"    ↻ Retrying in 2 seconds...")
+                            time.sleep(2)
+                        else:
+                            print(f"    ✗ Failed to process title after {max_retries} attempts: {str(e)}")
+                            failed_fields.append(('title', str(e)))
+            else:
+                print(f"  ⊘ Skipping title (empty or null)")
+
             # 2. Process KEYWORDS
-            if keywords and keywords.strip():
-                print(f"Processing keywords for paper {paper_id}")
-                keywords_embedding = self.generate_embedding(keywords)
-                self.insert_vector(conn, paper_id, 'keywords', keywords, 0, keywords_embedding)
-            
+            if self.is_valid_text(keywords):
+                print(f"  → Processing keywords for paper {paper_id}")
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        keywords_embedding = self.generate_embedding(keywords)
+                        self.insert_vector(conn, paper_id, 'keywords', keywords, 0, keywords_embedding)
+                        processed_fields.append('keywords')
+                        print(f"    ✓ Keywords processed successfully")
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            print(f"    ⚠ Error processing keywords (attempt {retry_count}/{max_retries}): {str(e)}")
+                            print(f"    ↻ Retrying in 2 seconds...")
+                            time.sleep(2)
+                        else:
+                            print(f"    ✗ Failed to process keywords after {max_retries} attempts: {str(e)}")
+                            failed_fields.append(('keywords', str(e)))
+            else:
+                print(f"  ⊘ Skipping keywords (empty or null)")
+
             # 3. Process ABSTRACT (dengan splitting jika perlu)
-            if abstract and abstract.strip():
+            if self.is_valid_text(abstract):
                 abstract_chunks = self.split_abstract(abstract)
-                print(f"Processing abstract for paper {paper_id} - {len(abstract_chunks)} chunk(s)")
+                print(f"  → Processing abstract for paper {paper_id} - {len(abstract_chunks)} chunk(s)")
+                
+                abstract_success = 0
+                abstract_failed = 0
                 
                 for idx, chunk in enumerate(abstract_chunks):
-                    chunk_embedding = self.generate_embedding(chunk)
-                    self.insert_vector(conn, paper_id, 'abstract', chunk, idx, chunk_embedding)
-            
+                    retry_count = 0
+                    while retry_count < max_retries:
+                        try:
+                            chunk_embedding = self.generate_embedding(chunk)
+                            self.insert_vector(conn, paper_id, 'abstract', chunk, idx, chunk_embedding)
+                            abstract_success += 1
+                            print(f"    ✓ Abstract chunk {idx+1}/{len(abstract_chunks)} processed")
+                            break
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                print(f"    ⚠ Error processing abstract chunk {idx+1} (attempt {retry_count}/{max_retries}): {str(e)}")
+                                print(f"    ↻ Retrying in 2 seconds...")
+                                time.sleep(2)
+                            else:
+                                print(f"    ✗ Failed to process abstract chunk {idx+1} after {max_retries} attempts: {str(e)}")
+                                abstract_failed += 1
+                                failed_fields.append((f'abstract_chunk_{idx}', str(e)))
+                
+                if abstract_success > 0:
+                    processed_fields.append(f'abstract ({abstract_success}/{len(abstract_chunks)} chunks)')
+            else:
+                print(f"  ⊘ Skipping abstract (empty or null)")
+
             conn.commit()
-            print(f"✓ Successfully processed paper {paper_id}")
+            
+            # Print summary
+            print(f"\n  {'='*60}")
+            if processed_fields:
+                print(f"  ✓ Successfully processed: {', '.join(processed_fields)}")
+            if failed_fields:
+                print(f"  ✗ Failed to process:")
+                for field, error in failed_fields:
+                    print(f"    - {field}: {error}")
+            
+            if not processed_fields:
+                print(f"  ⚠ WARNING: No fields were processed for paper {paper_id}")
+            
+            print(f"  {'='*60}\n")
+            
+            return len(failed_fields) == 0  # Return True jika tidak ada yang gagal
             
         except Exception as e:
             conn.rollback()
-            print(f"✗ Error processing paper {paper_id}: {str(e)}")
+            print(f"\n  ✗ CRITICAL ERROR processing paper {paper_id}: {str(e)}")
+            print(f"  Error type: {type(e).__name__}")
+            import traceback
+            print(f"  Traceback:\n{traceback.format_exc()}")
             raise
-        
         finally:
             conn.close()
-    
+
     def process_all_papers(self, limit: int = None, regenerate: bool = False):
         """
         Process semua papers dari database
@@ -143,16 +251,14 @@ class HierarchicalVectorStore:
         
         # Query untuk ambil semua paper
         query = """
-        SELECT item_uuid, title, abstract, keywords 
-        FROM bot.paper_metadata
+            SELECT item_uuid, title, abstract, keywords 
+            FROM bot.paper_metadata
         """
-        
         if limit:
             query += f" LIMIT {limit}"
         
         cursor.execute(query)
         papers = cursor.fetchall()
-        
         cursor.close()
         conn.close()
         
@@ -161,7 +267,11 @@ class HierarchicalVectorStore:
             print("MODE: REGENERATE (akan hapus dan buat ulang semua vectors)")
         else:
             print("MODE: UPDATE (hanya process paper baru)")
-        print("="*50)
+        print("="*80)
+        
+        success_count = 0
+        partial_success_count = 0
+        error_count = 0
         
         for i, (item_uuid, title, abstract, keywords) in enumerate(papers, 1):
             print(f"\n[{i}/{len(papers)}] Processing paper: {item_uuid}")
@@ -169,14 +279,28 @@ class HierarchicalVectorStore:
                 if regenerate:
                     # Hapus vectors lama terlebih dahulu
                     self.clear_vectors_for_paper(item_uuid)
-                self.process_paper(item_uuid, title, abstract, keywords)
+                
+                fully_successful = self.process_paper(item_uuid, title, abstract, keywords)
+                
+                if fully_successful:
+                    success_count += 1
+                else:
+                    partial_success_count += 1
+                    
             except Exception as e:
-                print(f"Skipping paper {item_uuid} due to error")
+                error_count += 1
+                print(f"  ✗ Critical error for paper {item_uuid}, continuing to next paper...")
                 continue
         
-        print("\n" + "="*50)
-        print("Processing complete!")
-    
+        print("\n" + "="*80)
+        print("PROCESSING COMPLETE!")
+        print("="*80)
+        print(f"Total papers: {len(papers)}")
+        print(f"✓ Fully successful: {success_count}")
+        print(f"⚠ Partially successful (some fields failed): {partial_success_count}")
+        print(f"✗ Critical errors: {error_count}")
+        print("="*80)
+
     def process_new_papers_only(self, limit: int = None):
         """
         Process hanya papers yang belum punya vectors
@@ -187,18 +311,16 @@ class HierarchicalVectorStore:
         
         # Query untuk ambil paper yang belum ada di vector_store
         query = """
-        SELECT pm.item_uuid, pm.title, pm.abstract, pm.keywords 
-        FROM bot.paper_metadata pm
-        LEFT JOIN bot.vector_store vs ON pm.item_uuid = vs.paper_id
-        WHERE vs.paper_id IS NULL
+            SELECT pm.item_uuid, pm.title, pm.abstract, pm.keywords
+            FROM bot.paper_metadata pm
+            LEFT JOIN bot.vector_store vs ON pm.item_uuid = vs.paper_id
+            WHERE vs.paper_id IS NULL
         """
-        
         if limit:
             query += f" LIMIT {limit}"
         
         cursor.execute(query)
         new_papers = cursor.fetchall()
-        
         cursor.close()
         conn.close()
         
@@ -207,23 +329,38 @@ class HierarchicalVectorStore:
             return
         
         print(f"\nFound {len(new_papers)} NEW papers to process")
-        print("="*50)
+        print("="*80)
+        
+        success_count = 0
+        partial_success_count = 0
+        error_count = 0
         
         for i, (item_uuid, title, abstract, keywords) in enumerate(new_papers, 1):
             print(f"\n[{i}/{len(new_papers)}] Processing new paper: {item_uuid}")
             try:
-                self.process_paper(item_uuid, title, abstract, keywords)
+                fully_successful = self.process_paper(item_uuid, title, abstract, keywords)
+                
+                if fully_successful:
+                    success_count += 1
+                else:
+                    partial_success_count += 1
+                    
             except Exception as e:
-                print(f"Skipping paper {item_uuid} due to error")
+                error_count += 1
+                print(f"  ✗ Critical error for paper {item_uuid}, continuing to next paper...")
                 continue
         
-        print("\n" + "="*50)
-        print("Processing complete!")
-    
+        print("\n" + "="*80)
+        print("PROCESSING COMPLETE!")
+        print("="*80)
+        print(f"Total new papers: {len(new_papers)}")
+        print(f"✓ Fully successful: {success_count}")
+        print(f"⚠ Partially successful (some fields failed): {partial_success_count}")
+        print(f"✗ Critical errors: {error_count}")
+        print("="*80)
+
     def get_statistics(self):
-        """
-        Dapatkan statistik dari vector store
-        """
+        """Dapatkan statistik dari vector store"""
         conn = self.connect_db()
         cursor = conn.cursor()
         
@@ -253,6 +390,7 @@ class HierarchicalVectorStore:
         print("\n" + "="*50)
         print("VECTOR STORE STATISTICS")
         print("="*50)
+        print(f"Device: {self.device}")
         print(f"Model: Qwen/Qwen3-Embedding-0.6B")
         print(f"Embedding dimension: {self.embedding_dim}")
         print(f"Total papers in database: {total_papers}")
@@ -263,22 +401,25 @@ class HierarchicalVectorStore:
         for chunk_type, count in breakdown:
             print(f"  - {chunk_type}: {count}")
         print("="*50)
-    
+
     def clear_vectors_for_paper(self, paper_id: str):
         """Hapus semua vectors untuk paper tertentu (jika perlu re-process)"""
         conn = self.connect_db()
         cursor = conn.cursor()
-        
         cursor.execute("DELETE FROM bot.vector_store WHERE paper_id = %s", (paper_id,))
         conn.commit()
-        
         cursor.close()
         conn.close()
-        print(f"Cleared all vectors for paper {paper_id}")
+        print(f"  ↻ Cleared all vectors for paper {paper_id}")
+
+    def clear_gpu_cache(self):
+        """Bersihkan GPU cache jika menggunakan CUDA"""
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+            print("GPU cache cleared")
 
 
 # ============= USAGE EXAMPLE =============
-
 if __name__ == "__main__":
     # Database configuration
     db_config = {
@@ -290,7 +431,8 @@ if __name__ == "__main__":
     }
     
     # Initialize vector store dengan Qwen3-Embedding-0.6B
-    vector_store = HierarchicalVectorStore(db_config)
+    # device='cuda' untuk force GPU, 'cpu' untuk CPU, None untuk auto-detect
+    vector_store = HierarchicalVectorStore(db_config, device='cuda')
     
     # ===== SCENARIO 1: FIRST TIME SETUP =====
     # Process semua papers untuk pertama kali
@@ -327,3 +469,7 @@ if __name__ == "__main__":
     # ===== SCENARIO 7: CHECK STATISTICS =====
     # Lihat statistik vector store
     vector_store.get_statistics()
+    
+    # ===== SCENARIO 8: CLEAR GPU CACHE =====
+    # Bersihkan GPU cache setelah selesai processing
+    # vector_store.clear_gpu_cache()
