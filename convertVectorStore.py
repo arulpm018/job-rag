@@ -123,10 +123,31 @@ class HierarchicalVectorStore:
             return False
         return True
 
+    def format_judul_keyword(self, title: str, keywords: str) -> str:
+        """
+        Format gabungan judul dan keyword dengan struktur yang jelas
+        Format: 
+        Judul: [title]
+        Kata Kunci: [keywords atau "Tidak tersedia"]
+        """
+        # Handle title
+        title_text = title.strip() if self.is_valid_text(title) else "Tidak tersedia"
+        
+        # Handle keywords
+        if self.is_valid_text(keywords):
+            keywords_text = keywords.strip()
+        else:
+            keywords_text = "Tidak tersedia"
+        
+        # Format dengan struktur yang jelas
+        formatted_text = f"Judul: {title_text}\nKata Kunci: {keywords_text}"
+        return formatted_text
+
     def process_paper(self, paper_id: str, title: str, abstract: str, keywords: str, 
-                     max_retries: int = 3):
+                     max_retries: int = 3, include_judul_keyword: bool = True):
         """
         Process satu paper menjadi embeddings dengan retry mechanism
+        include_judul_keyword: jika True, generate chunk_type judul_keyword
         """
         conn = self.connect_db()
         processed_fields = []
@@ -211,6 +232,29 @@ class HierarchicalVectorStore:
                     processed_fields.append(f'abstract ({abstract_success}/{len(abstract_chunks)} chunks)')
             else:
                 print(f"  ⊘ Skipping abstract (empty or null)")
+
+            # 4. Process JUDUL_KEYWORD (gabungan title dan keywords)
+            if include_judul_keyword:
+                # Generate judul_keyword bahkan jika salah satu field kosong
+                print(f"  → Processing judul_keyword for paper {paper_id}")
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        judul_keyword_text = self.format_judul_keyword(title, keywords)
+                        judul_keyword_embedding = self.generate_embedding(judul_keyword_text)
+                        self.insert_vector(conn, paper_id, 'judul_keyword', judul_keyword_text, 0, judul_keyword_embedding)
+                        processed_fields.append('judul_keyword')
+                        print(f"    ✓ Judul_keyword processed successfully")
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            print(f"    ⚠ Error processing judul_keyword (attempt {retry_count}/{max_retries}): {str(e)}")
+                            print(f"    ↻ Retrying in 2 seconds...")
+                            time.sleep(2)
+                        else:
+                            print(f"    ✗ Failed to process judul_keyword after {max_retries} attempts: {str(e)}")
+                            failed_fields.append(('judul_keyword', str(e)))
 
             conn.commit()
             
@@ -402,6 +446,98 @@ class HierarchicalVectorStore:
             print(f"  - {chunk_type}: {count}")
         print("="*50)
 
+    def process_judul_keyword_for_all_papers(self, limit: int = None, regenerate: bool = False):
+        """
+        Generate judul_keyword untuk semua papers atau yang belum punya
+        limit: batasi jumlah paper yang diproses (optional)
+        regenerate: jika True, hapus dan generate ulang judul_keyword untuk semua papers
+        """
+        conn = self.connect_db()
+        cursor = conn.cursor()
+        
+        if regenerate:
+            # Ambil semua papers
+            query = """
+                SELECT item_uuid, title, keywords 
+                FROM bot.paper_metadata
+            """
+            if limit:
+                query += f" LIMIT {limit}"
+        else:
+            # Ambil papers yang belum punya judul_keyword
+            query = """
+                SELECT pm.item_uuid, pm.title, pm.keywords
+                FROM bot.paper_metadata pm
+                LEFT JOIN bot.vector_store vs ON pm.item_uuid = vs.paper_id 
+                    AND vs.chunk_type = 'judul_keyword'
+                WHERE vs.paper_id IS NULL
+            """
+            if limit:
+                query += f" LIMIT {limit}"
+        
+        cursor.execute(query)
+        papers = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        if len(papers) == 0:
+            print("\nTidak ada papers yang perlu diproses untuk judul_keyword!")
+            return
+        
+        print(f"\nFound {len(papers)} papers untuk generate judul_keyword")
+        if regenerate:
+            print("MODE: REGENERATE (akan hapus dan buat ulang judul_keyword)")
+        else:
+            print("MODE: UPDATE (hanya papers yang belum punya judul_keyword)")
+        print("="*80)
+        
+        success_count = 0
+        error_count = 0
+        
+        for i, (item_uuid, title, keywords) in enumerate(papers, 1):
+            print(f"\n[{i}/{len(papers)}] Processing judul_keyword for paper: {item_uuid}")
+            
+            try:
+                conn = self.connect_db()
+                
+                # Hapus judul_keyword lama jika regenerate
+                if regenerate:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "DELETE FROM bot.vector_store WHERE paper_id = %s AND chunk_type = 'judul_keyword'",
+                        (item_uuid,)
+                    )
+                    cursor.close()
+                    print(f"  ↻ Cleared old judul_keyword")
+                
+                # Generate dan insert judul_keyword
+                judul_keyword_text = self.format_judul_keyword(title, keywords)
+                judul_keyword_embedding = self.generate_embedding(judul_keyword_text)
+                self.insert_vector(conn, item_uuid, 'judul_keyword', judul_keyword_text, 0, judul_keyword_embedding)
+                
+                conn.commit()
+                conn.close()
+                
+                success_count += 1
+                print(f"  ✓ Judul_keyword generated successfully")
+                print(f"  Content preview: {judul_keyword_text[:100]}...")
+                
+            except Exception as e:
+                error_count += 1
+                print(f"  ✗ Error processing paper {item_uuid}: {str(e)}")
+                if 'conn' in locals():
+                    conn.rollback()
+                    conn.close()
+                continue
+        
+        print("\n" + "="*80)
+        print("JUDUL_KEYWORD GENERATION COMPLETE!")
+        print("="*80)
+        print(f"Total papers processed: {len(papers)}")
+        print(f"✓ Success: {success_count}")
+        print(f"✗ Errors: {error_count}")
+        print("="*80)
+
     def clear_vectors_for_paper(self, paper_id: str):
         """Hapus semua vectors untuk paper tertentu (jika perlu re-process)"""
         conn = self.connect_db()
@@ -466,10 +602,22 @@ if __name__ == "__main__":
     # vector_store.clear_vectors_for_paper('uuid-123')
     # vector_store.process_paper('uuid-123', 'title', 'abstract', 'keywords')
     
-    # ===== SCENARIO 7: CHECK STATISTICS =====
-    # Lihat statistik vector store
+    # ===== SCENARIO 7: GENERATE JUDUL_KEYWORD UNTUK SEMUA PAPERS =====
+    # Generate judul_keyword untuk papers yang belum punya
+    # vector_store.process_judul_keyword_for_all_papers()
+    
+    # ===== SCENARIO 8: REGENERATE SEMUA JUDUL_KEYWORD =====
+    # Hapus dan generate ulang SEMUA judul_keyword
+    # vector_store.process_judul_keyword_for_all_papers(regenerate=True)
+    
+    # ===== SCENARIO 9: TESTING JUDUL_KEYWORD =====
+    # Generate judul_keyword dengan limit untuk testing
+    # vector_store.process_judul_keyword_for_all_papers(limit=5)
+    
+    # ===== SCENARIO 10: CHECK STATISTICS =====
+    # Lihat statistik vector store (termasuk judul_keyword)
     vector_store.get_statistics()
     
-    # ===== SCENARIO 8: CLEAR GPU CACHE =====
+    # ===== SCENARIO 11: CLEAR GPU CACHE =====
     # Bersihkan GPU cache setelah selesai processing
     # vector_store.clear_gpu_cache()
