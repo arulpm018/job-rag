@@ -28,6 +28,9 @@ class HierarchicalVectorStore:
         # Deteksi dan setup device (GPU/CPU)
         if device is None:
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        elif device == 'cuda' and not torch.cuda.is_available():
+            print("⚠️ CUDA requested but not available. Falling back to CPU instead.")
+            self.device = 'cpu'
         else:
             self.device = device
         
@@ -568,7 +571,7 @@ if __name__ == "__main__":
     
     # Initialize vector store dengan Qwen3-Embedding-0.6B
     # device='cuda' untuk force GPU, 'cpu' untuk CPU, None untuk auto-detect
-    vector_store = HierarchicalVectorStore(db_config, device='cuda')
+    vector_store = HierarchicalVectorStore(db_config, device=None)
     
     # ===== SCENARIO 1: FIRST TIME SETUP =====
     # Process semua papers untuk pertama kali
@@ -604,7 +607,7 @@ if __name__ == "__main__":
     
     # ===== SCENARIO 7: GENERATE JUDUL_KEYWORD UNTUK SEMUA PAPERS =====
     # Generate judul_keyword untuk papers yang belum punya
-    # vector_store.process_judul_keyword_for_all_papers()
+    vector_store.process_judul_keyword_for_all_papers()
     
     # ===== SCENARIO 8: REGENERATE SEMUA JUDUL_KEYWORD =====
     # Hapus dan generate ulang SEMUA judul_keyword
